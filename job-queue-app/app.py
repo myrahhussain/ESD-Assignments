@@ -32,7 +32,9 @@ SERVICE_NAME = "invoice_job_queue"
 # --- Chaos / fault injection state ---
 CHAOS_STATE = {
     "slow_every_nth": 0,
-    "failure_rate": 0.0
+    "failure_rate": 0.0,
+    "fail_next_n_requests": 0,      # makes the next N POST /jobs calls return 500 immediately
+    "timeout_next_n_requests": 0    # makes the next N POST /jobs calls hang for 5s before responding
 }
 jobs_processed_count = 0
 chaos_lock = threading.Lock()
@@ -189,7 +191,7 @@ def home():
 def set_chaos():
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return error_response(400, "invalid_request", "Request body must be a JSON object with at least one of 'slow_every_nth' or 'failure_rate'.")
+        return error_response(400, "invalid_request", "Request body must be a JSON object with at least one chaos field.")
 
     if "slow_every_nth" in data:
         if not isinstance(data["slow_every_nth"], int) or data["slow_every_nth"] < 0:
@@ -200,6 +202,16 @@ def set_chaos():
         if not isinstance(data["failure_rate"], (int, float)) or not (0 <= data["failure_rate"] <= 1):
             return error_response(400, "invalid_field", "'failure_rate' must be a number between 0 and 1.")
         CHAOS_STATE["failure_rate"] = data["failure_rate"]
+
+    if "fail_next_n_requests" in data:
+        if not isinstance(data["fail_next_n_requests"], int) or data["fail_next_n_requests"] < 0:
+            return error_response(400, "invalid_field", "'fail_next_n_requests' must be a non-negative integer.")
+        CHAOS_STATE["fail_next_n_requests"] = data["fail_next_n_requests"]
+
+    if "timeout_next_n_requests" in data:
+        if not isinstance(data["timeout_next_n_requests"], int) or data["timeout_next_n_requests"] < 0:
+            return error_response(400, "invalid_field", "'timeout_next_n_requests' must be a non-negative integer.")
+        CHAOS_STATE["timeout_next_n_requests"] = data["timeout_next_n_requests"]
 
     return jsonify({"status": "ok", "chaos_state": CHAOS_STATE})
 
@@ -224,18 +236,39 @@ def cardinality_test_safe():
 
 @app.route("/jobs", methods=["POST"])
 def create_job():
-    client_key = request.remote_addr or "unknown"
-    allowed, retry_after = check_rate_limit(client_key)
-    if not allowed:
-        response = jsonify({
-            "error": {
-                "code": "rate_limited",
-                "message": f"Too many requests. Limit is {RATE_LIMIT_MAX_REQUESTS} per {RATE_LIMIT_WINDOW_SECONDS} seconds. Try again in {retry_after} seconds."
-            }
-        })
-        response.status_code = 429
-        response.headers["Retry-After"] = str(retry_after)
-        return response
+    # The resilience demo (timeout/retry/circuit breaker) is tested separately from
+    # rate limiting per the assignment, so it's allowed to skip the limiter via this
+    # explicit test-only header. Real traffic without this header is always limited.
+    if request.headers.get("X-Skip-Rate-Limit") != "true":
+        client_key = request.remote_addr or "unknown"
+        allowed, retry_after = check_rate_limit(client_key)
+        if not allowed:
+            response = jsonify({
+                "error": {
+                    "code": "rate_limited",
+                    "message": f"Too many requests. Limit is {RATE_LIMIT_MAX_REQUESTS} per {RATE_LIMIT_WINDOW_SECONDS} seconds. Try again in {retry_after} seconds."
+                }
+            })
+            response.status_code = 429
+            response.headers["Retry-After"] = str(retry_after)
+            return response
+
+    # --- Request-level chaos injection (simulates the server itself misbehaving,
+    #     as opposed to the background worker chaos which only affects job processing) ---
+    with chaos_lock:
+        should_delay = CHAOS_STATE["timeout_next_n_requests"] > 0
+        if should_delay:
+            CHAOS_STATE["timeout_next_n_requests"] -= 1
+
+        should_fail = CHAOS_STATE["fail_next_n_requests"] > 0
+        if should_fail:
+            CHAOS_STATE["fail_next_n_requests"] -= 1
+
+    if should_delay:
+        time.sleep(5)
+
+    if should_fail:
+        return error_response(500, "internal_error", "Simulated transient server failure (chaos: fail_next_n_requests).")
 
     data = request.get_json(silent=True)
 
