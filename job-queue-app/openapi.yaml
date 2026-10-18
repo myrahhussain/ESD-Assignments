@@ -1,0 +1,297 @@
+openapi: 3.0.3
+info:
+  title: Invoice Job Queue API
+  description: >
+    A small job queue API for generating customer invoices asynchronously.
+    A client submits a job, a background worker processes it, and the
+    client can poll for job status until the invoice is ready.
+  version: "1.0.0"
+servers:
+  - url: http://127.0.0.1:5000
+    description: Local development server
+
+paths:
+  /:
+    get:
+      summary: Basic liveness check
+      operationId: home
+      responses:
+        "200":
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: "This is Myrah's invoice job queue."
+
+  /chaos:
+    get:
+      summary: Get the current fault-injection (chaos) settings
+      operationId: getChaos
+      responses:
+        "200":
+          description: Current chaos state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChaosState"
+    post:
+      summary: Update fault-injection (chaos) settings
+      operationId: setChaos
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChaosUpdateRequest"
+            examples:
+              slowEveryThird:
+                value: { "slow_every_nth": 3 }
+              thirtyPercentFailures:
+                value: { "failure_rate": 0.3 }
+      responses:
+        "200":
+          description: Chaos settings updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  chaos_state:
+                    $ref: "#/components/schemas/ChaosState"
+        "400":
+          description: Invalid chaos settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: invalid_field
+                  message: "'failure_rate' must be a number between 0 and 1."
+
+  /jobs:
+    post:
+      summary: Submit a new invoice job
+      operationId: createJob
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: >
+            Optional client-supplied key. Repeating a request with the
+            same key returns the original job instead of creating a new one.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJobRequest"
+            example:
+              customer: "Hira Naveed"
+              items:
+                - name: "Chocolate Eclairs"
+                  qty: 4
+                  price: 6
+      responses:
+        "201":
+          description: Job created
+          headers:
+            Location:
+              description: URL of the newly created job
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobCreatedResponse"
+              example:
+                job_id: "2fd7e62b-e227-4519-89c2-f60c654c43e5"
+                status: pending
+        "200":
+          description: >
+            Idempotent replay — a request with this Idempotency-Key was
+            already processed, so the original job is returned unchanged.
+          headers:
+            Idempotent-Replayed:
+              schema:
+                type: string
+                example: "true"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobCreatedResponse"
+        "400":
+          description: Invalid request body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingItems:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: "Field 'items' is required and must be a non-empty list."
+                badQty:
+                  value:
+                    error:
+                      code: invalid_request
+                      message: "Each item needs a positive numeric 'qty'."
+
+  /jobs/{job_id}:
+    get:
+      summary: Get the status (and result, if done) of a job
+      operationId: getJob
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Job found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatusResponse"
+        "404":
+          description: No job exists with that id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: job_not_found
+                  message: "No job with id 'bad-id' exists."
+
+  /cardinality-test:
+    get:
+      summary: Demo endpoint showing cardinality explosion (unique label per call)
+      operationId: cardinalityTest
+      responses:
+        "200":
+          description: Call recorded with a unique request_id label
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id:
+                    type: string
+                    format: uuid
+
+  /cardinality-test-safe:
+    get:
+      summary: Demo endpoint showing the safe, bounded-cardinality version
+      operationId: cardinalityTestSafe
+      responses:
+        "200":
+          description: Call recorded with no per-request label
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: called
+
+components:
+  schemas:
+    ChaosState:
+      type: object
+      properties:
+        slow_every_nth:
+          type: integer
+          minimum: 0
+          example: 0
+        failure_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+          example: 0.0
+
+    ChaosUpdateRequest:
+      type: object
+      properties:
+        slow_every_nth:
+          type: integer
+          minimum: 0
+        failure_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+      minProperties: 1
+
+    ItemInput:
+      type: object
+      required: [name, qty, price]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        qty:
+          type: number
+          exclusiveMinimum: 0
+        price:
+          type: number
+          minimum: 0
+
+    CreateJobRequest:
+      type: object
+      required: [customer, items]
+      properties:
+        customer:
+          type: string
+          minLength: 1
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ItemInput"
+
+    JobCreatedResponse:
+      type: object
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, in_progress, done, failed]
+
+    JobStatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [pending, in_progress, done, failed]
+        customer:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ItemInput"
+        file:
+          type: string
+          description: Path to the generated invoice PDF, present once status is "done"
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
