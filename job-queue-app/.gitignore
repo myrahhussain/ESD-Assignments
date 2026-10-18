@@ -1,0 +1,5 @@
+﻿jobs.db
+invoices/
+logs/
+__pycache__/
+*.pyc

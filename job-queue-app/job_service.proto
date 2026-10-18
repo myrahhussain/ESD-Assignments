@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package invoicequeue.v1;
+
+// Reimplements the same "submit an invoice job" operation as POST /jobs,
+// as a unary RPC. The actual business logic and storage live in
+// job_store.py, shared with the HTTP side -- this is not a wrapper
+// around the HTTP endpoint.
+service JobService {
+  rpc SubmitJob (SubmitJobRequest) returns (SubmitJobResponse);
+}
+
+message JobItem {
+  string name = 1;
+  double qty = 2;
+  double price = 3;
+}
+
+message SubmitJobRequest {
+  string customer = 1;
+  repeated JobItem items = 2;
+  string idempotency_key = 3; // optional; empty string means "no key supplied"
+}
+
+message SubmitJobResponse {
+  string job_id = 1;
+  string status = 2;
+  bool idempotent_replayed = 3;
+}
