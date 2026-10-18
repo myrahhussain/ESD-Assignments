@@ -78,6 +78,32 @@ cardinality_test_safe_counter = Counter(
     "Safe version - no per-request label, single series regardless of call volume"
 )
 
+
+def error_response(status_code, code, message):
+    """Consistent error envelope for every error this API returns."""
+    return jsonify({"error": {"code": code, "message": message}}), status_code
+
+
+def validate_job_payload(data):
+    """Returns an error message string if invalid, else None."""
+    if not isinstance(data, dict):
+        return "Request body must be a JSON object."
+    if "customer" not in data or not isinstance(data["customer"], str) or not data["customer"].strip():
+        return "Field 'customer' is required and must be a non-empty string."
+    if "items" not in data or not isinstance(data["items"], list) or len(data["items"]) == 0:
+        return "Field 'items' is required and must be a non-empty list."
+    for item in data["items"]:
+        if not isinstance(item, dict):
+            return "Each item must be an object with 'name', 'qty', and 'price'."
+        if "name" not in item or not isinstance(item["name"], str) or not item["name"].strip():
+            return "Each item needs a non-empty 'name'."
+        if "qty" not in item or not isinstance(item["qty"], (int, float)) or item["qty"] <= 0:
+            return "Each item needs a positive numeric 'qty'."
+        if "price" not in item or not isinstance(item["price"], (int, float)) or item["price"] < 0:
+            return "Each item needs a non-negative numeric 'price'."
+    return None
+
+
 def generate_invoice(job_id, customer, items):
     pdf = FPDF()
     pdf.add_page()
@@ -127,22 +153,35 @@ def generate_invoice(job_id, customer, items):
     pdf.output(filename)
     return filename, total
 
+
 @app.route("/")
 def home():
     return "This is Myrah's invoice job queue."
 
+
 @app.route("/chaos", methods=["POST"])
 def set_chaos():
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return error_response(400, "invalid_request", "Request body must be a JSON object with at least one of 'slow_every_nth' or 'failure_rate'.")
+
     if "slow_every_nth" in data:
+        if not isinstance(data["slow_every_nth"], int) or data["slow_every_nth"] < 0:
+            return error_response(400, "invalid_field", "'slow_every_nth' must be a non-negative integer.")
         CHAOS_STATE["slow_every_nth"] = data["slow_every_nth"]
+
     if "failure_rate" in data:
+        if not isinstance(data["failure_rate"], (int, float)) or not (0 <= data["failure_rate"] <= 1):
+            return error_response(400, "invalid_field", "'failure_rate' must be a number between 0 and 1.")
         CHAOS_STATE["failure_rate"] = data["failure_rate"]
+
     return jsonify({"status": "ok", "chaos_state": CHAOS_STATE})
+
 
 @app.route("/chaos", methods=["GET"])
 def get_chaos():
     return jsonify(CHAOS_STATE)
+
 
 @app.route("/cardinality-test")
 def cardinality_test():
@@ -150,14 +189,20 @@ def cardinality_test():
     cardinality_test_counter.labels(request_id=request_id).inc()
     return jsonify({"request_id": request_id})
 
+
 @app.route("/cardinality-test-safe")
 def cardinality_test_safe():
     cardinality_test_safe_counter.inc()
     return jsonify({"status": "called"})
 
+
 @app.route("/jobs", methods=["POST"])
 def create_job():
-    data = request.get_json()
+    data = request.get_json(silent=True)
+
+    validation_error = validate_job_payload(data)
+    if validation_error:
+        return error_response(400, "invalid_request", validation_error)
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
@@ -180,18 +225,24 @@ def create_job():
         }
     )
 
-    return jsonify({"job_id": job_id, "status": "pending"})
+    response = jsonify({"job_id": job_id, "status": "pending"})
+    response.status_code = 201
+    response.headers["Location"] = f"/jobs/{job_id}"
+    return response
+
 
 @app.route("/jobs/<job_id>")
 def get_job(job_id):
     if job_id not in jobs:
-        return jsonify({"error": "Job not found"}), 404
+        return error_response(404, "job_not_found", f"No job with id '{job_id}' exists.")
 
     return jsonify(jobs[job_id])
+
 
 @app.route("/metrics")
 def metrics():
     return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+
 
 def worker_loop():
     global jobs_processed_count
@@ -260,6 +311,7 @@ def worker_loop():
                 )
 
         time.sleep(1)
+
 
 if __name__ == "__main__":
     worker_thread = threading.Thread(target=worker_loop, daemon=True)
