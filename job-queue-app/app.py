@@ -6,6 +6,7 @@ import time
 import os
 import random
 import logging
+from collections import defaultdict, deque
 from pythonjsonlogger import jsonlogger
 from fpdf import FPDF
 from datetime import datetime
@@ -35,6 +36,30 @@ CHAOS_STATE = {
 }
 jobs_processed_count = 0
 chaos_lock = threading.Lock()
+
+# --- Rate limiting: POST /jobs is limited per client IP ---
+RATE_LIMIT_MAX_REQUESTS = 5
+RATE_LIMIT_WINDOW_SECONDS = 60
+rate_limit_lock = threading.Lock()
+request_timestamps = defaultdict(deque)  # client IP -> deque of request times within the window
+
+
+def check_rate_limit(client_key):
+    """Sliding-window rate limit. Returns (allowed: bool, retry_after_seconds: int)."""
+    now = time.time()
+    with rate_limit_lock:
+        timestamps = request_timestamps[client_key]
+
+        while timestamps and timestamps[0] <= now - RATE_LIMIT_WINDOW_SECONDS:
+            timestamps.popleft()
+
+        if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+            retry_after = int(RATE_LIMIT_WINDOW_SECONDS - (now - timestamps[0])) + 1
+            return False, retry_after
+
+        timestamps.append(now)
+        return True, 0
+
 
 jobs_submitted_total = Counter(
     "jobs_submitted_total",
@@ -199,6 +224,19 @@ def cardinality_test_safe():
 
 @app.route("/jobs", methods=["POST"])
 def create_job():
+    client_key = request.remote_addr or "unknown"
+    allowed, retry_after = check_rate_limit(client_key)
+    if not allowed:
+        response = jsonify({
+            "error": {
+                "code": "rate_limited",
+                "message": f"Too many requests. Limit is {RATE_LIMIT_MAX_REQUESTS} per {RATE_LIMIT_WINDOW_SECONDS} seconds. Try again in {retry_after} seconds."
+            }
+        })
+        response.status_code = 429
+        response.headers["Retry-After"] = str(retry_after)
+        return response
+
     data = request.get_json(silent=True)
 
     validation_error = validate_job_payload(data)
