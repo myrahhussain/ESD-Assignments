@@ -13,6 +13,7 @@ from datetime import datetime
 app = Flask(__name__)
 
 jobs = {}
+idempotency_keys = {}  # maps an Idempotency-Key header value -> job_id, so retries don't create duplicate jobs
 
 os.makedirs("invoices", exist_ok=True)
 os.makedirs("logs", exist_ok=True)
@@ -204,12 +205,25 @@ def create_job():
     if validation_error:
         return error_response(400, "invalid_request", validation_error)
 
+    idempotency_key = request.headers.get("Idempotency-Key")
+
+    if idempotency_key and idempotency_key in idempotency_keys:
+        existing_job_id = idempotency_keys[idempotency_key]
+        response = jsonify({"job_id": existing_job_id, "status": jobs[existing_job_id]["status"]})
+        response.status_code = 200
+        response.headers["Location"] = f"/jobs/{existing_job_id}"
+        response.headers["Idempotent-Replayed"] = "true"
+        return response
+
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "pending",
         "customer": data["customer"],
         "items": data["items"]
     }
+
+    if idempotency_key:
+        idempotency_keys[idempotency_key] = job_id
 
     jobs_submitted_total.inc()
     jobs_in_progress.inc()
