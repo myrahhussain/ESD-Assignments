@@ -6,6 +6,10 @@ scrape_configs:
     static_configs:
       - targets: ["host.docker.internal:5000"]
 
+  - job_name: "invoice_job_queue_grpc"
+    static_configs:
+      - targets: ["host.docker.internal:8001"]
+
   - job_name: "node_exporter"
     static_configs:
       - targets: ["host.docker.internal:9100"]
