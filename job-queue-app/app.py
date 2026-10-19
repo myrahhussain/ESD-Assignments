@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from prometheus_client import Counter, Gauge, Histogram, Summary, generate_latest, CONTENT_TYPE_LATEST
 import threading
 import time
@@ -63,9 +63,11 @@ def check_rate_limit(client_key):
         return True, 0
 
 
+# --- Business metrics (from Assignment 1, with the "protocol" label added) ---
 jobs_submitted_total = Counter(
     "jobs_submitted_total",
-    "Total number of invoice jobs submitted via the HTTP API"
+    "Total number of invoice jobs submitted",
+    ["protocol"]
 )
 
 jobs_in_progress = Gauge(
@@ -94,6 +96,33 @@ jobs_failed_total = Counter(
     "Total number of jobs that failed during processing"
 )
 
+# --- Assignment 2, Part C: new HTTP-operation metrics ---
+# "endpoint" is the Flask route TEMPLATE (e.g. /jobs/<job_id>), never the raw URL,
+# so the number of label values stays small and fixed no matter how many job IDs exist.
+http_requests_total = Counter(
+    "http_requests_total",
+    "Total HTTP requests handled, by method, route template and response status code",
+    ["method", "endpoint", "status"]
+)
+
+http_request_duration_seconds = Histogram(
+    "http_request_duration_seconds",
+    "Server-side time spent handling an HTTP request, in seconds",
+    ["method", "endpoint"],
+    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+)
+
+rate_limit_rejections_total = Counter(
+    "rate_limit_rejections_total",
+    "Requests rejected with 429 because the per-client rate limit was exceeded"
+)
+
+idempotent_replays_total = Counter(
+    "idempotent_replays_total",
+    "Submissions answered from an existing Idempotency-Key instead of creating a job",
+    ["protocol"]
+)
+
 # --- Cardinality explosion demo ---
 cardinality_test_counter = Counter(
     "cardinality_test_requests_total",
@@ -105,6 +134,25 @@ cardinality_test_safe_counter = Counter(
     "cardinality_test_safe_requests_total",
     "Safe version - no per-request label, single series regardless of call volume"
 )
+
+
+@app.before_request
+def start_timer():
+    g.request_start = time.time()
+
+
+@app.after_request
+def record_http_metrics(response):
+    # Use the route template, not request.path, so /jobs/<any-id> is one label value.
+    endpoint = request.url_rule.rule if request.url_rule else "unmatched"
+    if endpoint != "/metrics":  # don't let Prometheus scraping count itself
+        http_requests_total.labels(
+            method=request.method, endpoint=endpoint, status=str(response.status_code)
+        ).inc()
+        http_request_duration_seconds.labels(
+            method=request.method, endpoint=endpoint
+        ).observe(time.time() - g.request_start)
+    return response
 
 
 def error_response(status_code, code, message):
@@ -224,6 +272,7 @@ def create_job():
         client_key = request.remote_addr or "unknown"
         allowed, retry_after = check_rate_limit(client_key)
         if not allowed:
+            rate_limit_rejections_total.inc()
             response = jsonify({
                 "error": {
                     "code": "rate_limited",
@@ -261,13 +310,14 @@ def create_job():
     job_id, status, is_replay = job_store.create_job(data["customer"], data["items"], idempotency_key)
 
     if is_replay:
+        idempotent_replays_total.labels(protocol="http").inc()
         response = jsonify({"job_id": job_id, "status": status})
         response.status_code = 200
         response.headers["Location"] = f"/jobs/{job_id}"
         response.headers["Idempotent-Replayed"] = "true"
         return response
 
-    jobs_submitted_total.inc()
+    jobs_submitted_total.labels(protocol="http").inc()
 
     logger.info(
         "Job submitted",
