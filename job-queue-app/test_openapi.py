@@ -1,4 +1,4 @@
-"""
+﻿"""
 Uses openapi.yaml as the source of truth to test real responses from the
 running Flask app. This is the "use it to inspect or test at least one
 endpoint" requirement for Assignment 2 Part A.
@@ -17,6 +17,10 @@ from jsonschema import validate, ValidationError
 
 BASE_URL = "http://127.0.0.1:5000"
 SPEC_FILE = "openapi.yaml"
+
+# Test-only header: keeps these checks from using up the rate limit, so the
+# rate limit can be shown separately (same header caller.py uses).
+SKIP_RATE_LIMIT = {"X-Skip-Rate-Limit": "true"}
 
 
 def load_spec():
@@ -67,7 +71,7 @@ def main():
     resp = requests.post(
         f"{BASE_URL}/jobs",
         json=valid_body,
-        headers={"Idempotency-Key": idem_key}
+        headers={**SKIP_RATE_LIMIT, "Idempotency-Key": idem_key}
     )
 
     all_passed &= check("Status code is 201", resp.status_code == 201)
@@ -90,7 +94,7 @@ def main():
     resp2 = requests.post(
         f"{BASE_URL}/jobs",
         json=valid_body,
-        headers={"Idempotency-Key": idem_key}
+        headers={**SKIP_RATE_LIMIT, "Idempotency-Key": idem_key}
     )
 
     all_passed &= check("Status code is 200 (idempotent replay)", resp2.status_code == 200)
@@ -104,7 +108,7 @@ def main():
     print("=" * 60)
 
     invalid_body = {"customer": "Missing Items Customer"}
-    resp3 = requests.post(f"{BASE_URL}/jobs", json=invalid_body)
+    resp3 = requests.post(f"{BASE_URL}/jobs", json=invalid_body, headers=SKIP_RATE_LIMIT)
 
     all_passed &= check("Status code is 400", resp3.status_code == 400)
 
